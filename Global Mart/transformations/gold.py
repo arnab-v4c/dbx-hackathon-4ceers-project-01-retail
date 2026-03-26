@@ -4,16 +4,12 @@
 # Pipeline Type: Spark Declarative Pipelines (SDP)
 # Target: globalmart.gold
 #
-# Dependency strategy:
-#   Cross-pipeline reads (Silver, MDM) → spark.read.table()
-#   Intra-pipeline reads (Gold→Gold)   → dp.read()
-#
-# Builds:
-#   3 Dimension tables   — dim_customers, dim_products, dim_vendors
-#   3 Fact tables        — fact_orders, fact_sales, fact_returns
-#   1 Generated table    — dim_dates
-#   4 Materialized Views — mv_revenue_by_region, mv_return_rate_by_vendor,
-#                          mv_slow_moving_products, mv_customer_return_history
+# 5 business-level DQ checks on facts and MVs:
+#   1. fact_sales: no_orphan_customers (Revenue Audit)
+#   2. fact_returns: refund_not_exceeding_5x_sales (Returns Fraud)
+#   3. mv_revenue_by_region: region_not_null (Revenue Audit)
+#   4. mv_return_rate_by_vendor: return_rate_in_range (Vendor Quality)
+#   5. mv_slow_moving_products: valid_days_since_sale (Inventory Blindspot)
 # =============================================================================
 
 # COMMAND ----------
@@ -21,22 +17,22 @@
 from pyspark import pipelines as dp
 from pyspark.sql.functions import (
     col, lit, coalesce, row_number, count, sum as _sum, avg,
-    round as _round, datediff, current_date, max as _max,
+    round as _round, datediff, current_date, current_timestamp, max as _max,
     min as _min, countDistinct, when, month, year, quarter,
     date_format, dayofweek, expr, monotonically_increasing_id,
-    to_date
+    to_date, abs as _abs
 )
 from pyspark.sql.window import Window
 
 # COMMAND ----------
 
-spark.sql("USE CATALOG globalmart_new")
+spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA gold")
 
 # COMMAND ----------
 
 # =============================================================================
-# DIMENSIONS — No intra-pipeline dependencies, read from MDM/Silver
+# DIMENSIONS
 # =============================================================================
 
 @dp.table(name="dim_customers", comment="Customer dimension — sourced from MDM golden records.")
@@ -44,24 +40,22 @@ def dim_customers():
     return (
         spark.read.table("globalmart.mdm.customers")
         .withColumn("customer_key", monotonically_increasing_id())
-        .select(
-            "customer_key", "customer_id", "customer_name", "customer_email",
-            "segment", "country", "city", "state", "postal_code", "region"
-        )
+        .select("customer_key", "customer_id", "customer_name", "customer_email",
+                "segment", "country", "city", "state", "postal_code", "region")
     )
 
+# COMMAND ----------
 
 @dp.table(name="dim_products", comment="Product dimension — sourced from MDM golden records.")
 def dim_products():
     return (
         spark.read.table("globalmart.mdm.products")
         .withColumn("product_key", monotonically_increasing_id())
-        .select(
-            "product_key", "product_id", "product_name", "brand",
-            "categories", "colors", "manufacturer"
-        )
+        .select("product_key", "product_id", "product_name", "brand",
+                "categories", "colors", "manufacturer")
     )
 
+# COMMAND ----------
 
 @dp.table(name="dim_vendors", comment="Vendor dimension — sourced from MDM golden records.")
 def dim_vendors():
@@ -71,25 +65,18 @@ def dim_vendors():
         .select("vendor_key", "vendor_id", "vendor_name")
     )
 
+# COMMAND ----------
 
-@dp.table(name="dim_dates", comment="Date dimension — generated calendar covering all order and return dates.")
+@dp.table(name="dim_dates", comment="Date dimension — generated calendar.")
 def dim_dates():
     orders = spark.read.table("globalmart.silver.orders")
-
-    min_date = orders.select(_min(to_date("order_purchase_timestamp"))).collect()[0][0]
-    max_date = orders.select(_max(to_date("order_purchase_timestamp"))).collect()[0][0]
-
-    # Safeguard against null dates
-    if min_date is None or max_date is None:
-        min_date = "2016-01-01"
-        max_date = "2019-12-31"
-
+    min_max_df = orders.select(
+        coalesce(_min(to_date("order_purchase_timestamp")), to_date(lit("2016-01-01"))).alias("min_date"),
+        coalesce(_max(to_date("order_purchase_timestamp")), to_date(lit("2019-12-31"))).alias("max_date")
+    )
     return (
-        spark.sql(f"""
-            SELECT explode(sequence(
-                DATE '{min_date}', DATE '{max_date}', INTERVAL 1 DAY
-            )) AS full_date
-        """)
+        min_max_df
+        .select(expr("explode(sequence(min_date, max_date, INTERVAL 1 DAY)) AS full_date"))
         .withColumn("date_key", expr("CAST(date_format(full_date, 'yyyyMMdd') AS INT)"))
         .withColumn("year", year("full_date"))
         .withColumn("quarter", quarter("full_date"))
@@ -105,7 +92,7 @@ def dim_dates():
 # COMMAND ----------
 
 # =============================================================================
-# FACT TABLES — Use dp.read() for Gold dimensions defined above
+# FACT TABLES
 # =============================================================================
 
 @dp.table(name="fact_orders", comment="Order fact — one row per order.")
@@ -113,32 +100,28 @@ def fact_orders():
     return (
         spark.read.table("globalmart.silver.orders")
         .withColumn("order_key", monotonically_increasing_id())
-        .select(
-            "order_key", "order_id", "customer_id", "vendor_id",
-            "ship_mode", "order_status", "order_purchase_timestamp",
-            "order_approved_timestamp", "order_delivered_carrier_timestamp",
-            "order_delivered_customer_timestamp", "order_estimated_delivery_timestamp"
-        )
+        .select("order_key", "order_id", "customer_id", "vendor_id",
+                "ship_mode", "order_status", "order_purchase_timestamp",
+                "order_approved_timestamp", "order_delivered_carrier_timestamp",
+                "order_delivered_customer_timestamp", "order_estimated_delivery_timestamp")
     )
 
+# COMMAND ----------
 
 @dp.table(name="fact_sales", comment="Sales fact — grain: one row per order-product line item.")
+@dp.expect("no_orphan_customers", "customer_key IS NOT NULL")
 def fact_sales():
     txn = spark.read.table("globalmart.silver.transactions")
     orders = spark.read.table("globalmart.silver.orders")
-
-    # Intra-pipeline reads via dp.read()
     dim_cust = dp.read("dim_customers")
     dim_prod = dp.read("dim_products")
     dim_vend = dp.read("dim_vendors")
     dim_ord = dp.read("fact_orders")
     dim_dt = dp.read("dim_dates")
 
-    base = (
-        txn.join(
-            orders.select("order_id", "customer_id", "vendor_id", "order_purchase_timestamp"),
-            on="order_id", how="inner"
-        )
+    base = txn.join(
+        orders.select("order_id", "customer_id", "vendor_id", "order_purchase_timestamp"),
+        on="order_id", how="inner"
     )
 
     return (
@@ -150,39 +133,42 @@ def fact_sales():
         .withColumn("order_date_key", expr("CAST(date_format(order_purchase_timestamp, 'yyyyMMdd') AS INT)"))
         .join(dim_dt.select("date_key"), dim_dt.date_key == col("order_date_key"), how="left")
         .withColumn("sales_key", monotonically_increasing_id())
-        .select(
-            "sales_key", "order_key", "customer_key", "product_key", "vendor_key",
-            col("date_key").alias("order_date_key"),
-            "order_id", "product_id", "customer_id", "vendor_id",
-            "sales", "quantity", "discount", "profit",
-            "payment_type", "payment_installments"
-        )
+        .select("sales_key", "order_key", "customer_key", "product_key", "vendor_key",
+                col("date_key").alias("order_date_key"),
+                "order_id", "product_id", "customer_id", "vendor_id",
+                "sales", "quantity", "discount", "profit",
+                "payment_type", "payment_installments")
     )
 
+@dp.table(name="fact_sales_quarantine", comment="Revenue Audit — transactions with no customer attribution.")
+def fact_sales_quarantine():
+    return (
+        dp.read("fact_sales")
+        .filter("customer_key IS NULL")
+        .withColumn("_expectation", lit("no_orphan_customers"))
+        .withColumn("_severity", lit("WARNING"))
+        .withColumn("_business_impact", lit("Revenue cannot be attributed to a customer segment or region — causes reconciliation failures"))
+        .withColumn("_quarantine_timestamp", current_timestamp())
+    )
+
+# COMMAND ----------
 
 @dp.table(name="fact_returns", comment="Returns fact — grain: one row per return event.")
+@dp.expect("refund_not_exceeding_5x_sales", "original_sales IS NULL OR refund_amount <= original_sales * 5")
 def fact_returns():
     ret = spark.read.table("globalmart.silver.returns")
     orders = spark.read.table("globalmart.silver.orders")
     txn = spark.read.table("globalmart.silver.transactions")
-
-    # Intra-pipeline reads via dp.read()
     dim_cust = dp.read("dim_customers")
     dim_prod = dp.read("dim_products")
     dim_vend = dp.read("dim_vendors")
     dim_ord = dp.read("fact_orders")
     dim_dt = dp.read("dim_dates")
 
-    # Match returns to the most likely product by comparing refund_amount to sales.
-    # Exact match (refund = sales) gets rank 1. If no exact match, closest by price wins.
-    # This is more accurate than picking the first product alphabetically.
-    txn_with_distance = (
-        txn
-        .select(
-            col("order_id").alias("_t_order_id"),
-            col("product_id"),
-            col("sales").alias("original_sales")
-        )
+    txn_with_distance = txn.select(
+        col("order_id").alias("_t_order_id"),
+        col("product_id"),
+        col("sales").alias("original_sales")
     )
 
     returns_x_txn = (
@@ -193,7 +179,6 @@ def fact_returns():
         .withColumn("_price_distance", expr("ABS(refund_amount - original_sales)"))
     )
 
-    # Rank: closest price match per return (order_id), tiebreak by product_id
     w_match = Window.partitionBy(ret.order_id).orderBy(col("_price_distance").asc(), col("product_id").asc())
     base = (
         returns_x_txn
@@ -215,27 +200,36 @@ def fact_returns():
                     when(col("original_sales") > 0,
                          _round(col("refund_amount") / col("original_sales"), 2))
                     .otherwise(lit(None)))
-        .select(
-            "return_key", "order_key", "customer_key", "product_key", "vendor_key",
-            col("date_key").alias("return_date_key"),
-            "order_id", "product_id", "customer_id", "vendor_id",
-            "refund_amount", "return_reason", "return_status",
-            "return_date", "original_sales", "return_to_sales_ratio"
-        )
+        .select("return_key", "order_key", "customer_key", "product_key", "vendor_key",
+                col("date_key").alias("return_date_key"),
+                "order_id", "product_id", "customer_id", "vendor_id",
+                "refund_amount", "return_reason", "return_status",
+                "return_date", "original_sales", "return_to_sales_ratio")
+    )
+
+@dp.table(name="fact_returns_quarantine", comment="Returns Fraud — refunds suspiciously exceeding product price.")
+def fact_returns_quarantine():
+    return (
+        dp.read("fact_returns")
+        .filter("original_sales IS NOT NULL AND refund_amount > original_sales * 5")
+        .withColumn("_expectation", lit("refund_not_exceeding_5x_sales"))
+        .withColumn("_severity", lit("WARNING"))
+        .withColumn("_business_impact", lit("Refund exceeds 5x the product sale price — potential fraud or price-matching error"))
+        .withColumn("_quarantine_timestamp", current_timestamp())
     )
 
 # COMMAND ----------
 
 # =============================================================================
-# MATERIALIZED VIEWS — Use dp.read() for Gold facts/dims defined above
+# MATERIALIZED VIEWS
 # =============================================================================
 
 @dp.table(name="mv_revenue_by_region", comment="Monthly revenue by region — addresses Revenue Audit.")
+@dp.expect("region_not_null", "region IS NOT NULL")
 def mv_revenue_by_region():
     fact = dp.read("fact_sales")
     dim_cust = dp.read("dim_customers")
     dim_dt = dp.read("dim_dates")
-
     return (
         fact
         .join(dim_cust.select("customer_key", "region"), on="customer_key", how="left")
@@ -253,30 +247,35 @@ def mv_revenue_by_region():
         .orderBy("year", "month", "region")
     )
 
+@dp.table(name="mv_revenue_by_region_quarantine", comment="Revenue Audit — revenue with no region attribution.")
+def mv_revenue_by_region_quarantine():
+    return (
+        dp.read("mv_revenue_by_region")
+        .filter("region IS NULL")
+        .withColumn("_expectation", lit("region_not_null"))
+        .withColumn("_severity", lit("WARNING"))
+        .withColumn("_business_impact", lit("Revenue cannot be attributed to a region — auditors cannot reconcile regional reports"))
+        .withColumn("_quarantine_timestamp", current_timestamp())
+    )
+
+# COMMAND ----------
 
 @dp.table(name="mv_return_rate_by_vendor", comment="Return rate by vendor — addresses Returns Fraud and vendor quality.")
+@dp.expect("return_rate_in_range", "return_rate_pct IS NULL OR (return_rate_pct >= 0 AND return_rate_pct <= 100)")
 def mv_return_rate_by_vendor():
     fact_s = dp.read("fact_sales")
     fact_r = dp.read("fact_returns")
     dim_vend = dp.read("dim_vendors")
 
-    sold = (
-        fact_s.groupBy("vendor_id")
-        .agg(
-            countDistinct("order_id").alias("total_orders_sold"),
-            _round(_sum("sales"), 2).alias("total_sales")
-        )
+    sold = fact_s.groupBy("vendor_id").agg(
+        countDistinct("order_id").alias("total_orders_sold"),
+        _round(_sum("sales"), 2).alias("total_sales")
     )
-
-    returned = (
-        fact_r.groupBy("vendor_id")
-        .agg(
-            count("*").alias("total_returns"),
-            _round(_sum("refund_amount"), 2).alias("total_refund_amount"),
-            _round(avg("refund_amount"), 2).alias("avg_refund_amount")
-        )
+    returned = fact_r.groupBy("vendor_id").agg(
+        count("*").alias("total_returns"),
+        _round(_sum("refund_amount"), 2).alias("total_refund_amount"),
+        _round(avg("refund_amount"), 2).alias("avg_refund_amount")
     )
-
     return (
         sold
         .join(returned, on="vendor_id", how="left")
@@ -285,21 +284,31 @@ def mv_return_rate_by_vendor():
         .withColumn("total_refund_amount", coalesce(col("total_refund_amount"), lit(0)))
         .withColumn("return_rate_pct",
                     _round((col("total_returns") / col("total_orders_sold")) * 100, 2))
-        .select(
-            "vendor_id", "vendor_name", "total_orders_sold", "total_sales",
-            "total_returns", "total_refund_amount", "avg_refund_amount", "return_rate_pct"
-        )
+        .select("vendor_id", "vendor_name", "total_orders_sold", "total_sales",
+                "total_returns", "total_refund_amount", "avg_refund_amount", "return_rate_pct")
         .orderBy(col("return_rate_pct").desc())
     )
 
+@dp.table(name="mv_return_rate_by_vendor_quarantine", comment="Vendor Quality — impossible return rate values.")
+def mv_return_rate_by_vendor_quarantine():
+    return (
+        dp.read("mv_return_rate_by_vendor")
+        .filter("return_rate_pct IS NOT NULL AND (return_rate_pct < 0 OR return_rate_pct > 100)")
+        .withColumn("_expectation", lit("return_rate_in_range"))
+        .withColumn("_severity", lit("WARNING"))
+        .withColumn("_business_impact", lit("Mathematically impossible return rate — merchandising team would make wrong vendor contract decisions"))
+        .withColumn("_quarantine_timestamp", current_timestamp())
+    )
+
+# COMMAND ----------
 
 @dp.table(name="mv_slow_moving_products", comment="Slow-moving products by region — addresses Inventory Blindspot.")
+@dp.expect("valid_days_since_sale", "days_since_last_sale IS NOT NULL AND days_since_last_sale >= 0")
 def mv_slow_moving_products():
     fact_s = dp.read("fact_sales")
     dim_prod = dp.read("dim_products")
     dim_cust = dp.read("dim_customers")
     dim_dt = dp.read("dim_dates")
-
     return (
         fact_s
         .join(dim_prod.select("product_key", "product_id", "product_name", "brand"),
@@ -321,21 +330,30 @@ def mv_slow_moving_products():
                     when(col("selling_period_days") > 0,
                          _round(col("total_quantity_sold") / col("selling_period_days"), 2))
                     .otherwise(col("total_quantity_sold")))
-        .select(
-            "product_id", "product_name", "brand", "region",
-            "total_quantity_sold", "total_sales", "order_count",
-            "first_sale_date", "last_sale_date",
-            "days_since_last_sale", "selling_period_days", "avg_daily_quantity"
-        )
+        .select("product_id", "product_name", "brand", "region",
+                "total_quantity_sold", "total_sales", "order_count",
+                "first_sale_date", "last_sale_date",
+                "days_since_last_sale", "selling_period_days", "avg_daily_quantity")
         .orderBy(col("days_since_last_sale").desc(), col("total_quantity_sold").asc())
     )
 
+@dp.table(name="mv_slow_moving_products_quarantine", comment="Inventory Blindspot — products with invalid velocity metrics.")
+def mv_slow_moving_products_quarantine():
+    return (
+        dp.read("mv_slow_moving_products")
+        .filter("days_since_last_sale IS NULL OR days_since_last_sale < 0")
+        .withColumn("_expectation", lit("valid_days_since_sale"))
+        .withColumn("_severity", lit("WARNING"))
+        .withColumn("_business_impact", lit("Product with invalid days-since-last-sale goes undetected — 12-18% revenue loss from missed discount window"))
+        .withColumn("_quarantine_timestamp", current_timestamp())
+    )
+
+# COMMAND ----------
 
 @dp.table(name="mv_customer_return_history", comment="Customer return history — addresses Returns Fraud with fraud risk scoring.")
 def mv_customer_return_history():
     fact_r = dp.read("fact_returns")
     dim_cust = dp.read("dim_customers")
-
     return (
         fact_r
         .join(dim_cust.select("customer_key", "customer_id", "customer_name",
@@ -361,11 +379,9 @@ def mv_customer_return_history():
                     when((col("total_returns") >= 5) & (col("avg_return_to_sales_ratio") > 0.8), "HIGH")
                     .when((col("total_returns") >= 3) | (col("max_single_refund") > 400), "MEDIUM")
                     .otherwise("LOW"))
-        .select(
-            "customer_id", "customer_name", "customer_email", "segment", "region",
-            "total_returns", "total_refund_amount", "avg_refund_amount", "max_single_refund",
-            "first_return_date", "last_return_date", "days_between_first_last_return",
-            "distinct_reasons", "avg_return_to_sales_ratio", "fraud_risk_score"
-        )
+        .select("customer_id", "customer_name", "customer_email", "segment", "region",
+                "total_returns", "total_refund_amount", "avg_refund_amount", "max_single_refund",
+                "first_return_date", "last_return_date", "days_between_first_last_return",
+                "distinct_reasons", "avg_return_to_sales_ratio", "fraud_risk_score")
         .orderBy(col("total_returns").desc())
     )

@@ -22,7 +22,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
-spark.sql("USE CATALOG globalmart_new")
+spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA mdm")
 
 # =============================================================================

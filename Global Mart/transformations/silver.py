@@ -4,7 +4,7 @@
 # Pipeline Type: Spark Declarative Pipelines (SDP)
 # Target Schema: globalmart.silver
 #
-# Instead of reading static column_mapping from ingestion_control, this
+# Instead of reading static column_mapping from config, this
 # pipeline uses an LLM to dynamically discover schema mappings from Bronze
 # table metadata + sample data. The LLM generates the same mapping structure
 # (source_column → canonical_column + transformation) that the config-driven
@@ -31,7 +31,7 @@ import json
 
 # COMMAND ----------
 
-spark.sql("USE CATALOG globalmart_new")
+spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA silver")
 
 RUN_ID = str(uuid.uuid4())
@@ -246,7 +246,7 @@ for entity in ["customers", "orders", "transactions", "returns", "products", "ve
     except Exception as e:
         print(f"[FALLBACK] {entity}: LLM failed — {type(e).__name__}: {str(e)}")
         CONFIG_MAPPINGS[entity] = (
-            spark.read.table("globalmart.ingestion_control.column_mapping")
+            spark.read.table("globalmart.config.column_mapping")
             .filter(col("entity") == entity)
             .select("source_column", "canonical_column", "transformation")
             .collect()
@@ -269,7 +269,7 @@ for entity, mappings in CONFIG_MAPPINGS.items():
         print(f"  {src} → {canon}" + (f" | transform: {xform}" if xform else ""))
 
 # DQ rules stay config-driven — business decisions, not schema discovery
-_rules_df = spark.read.table("globalmart.ingestion_control.dq_rules")
+_rules_df = spark.read.table("globalmart.config.dq_rules")
 CONFIG_RULES = {}
 for entity in ["customers", "orders", "transactions", "returns", "products", "vendors"]:
     CONFIG_RULES[entity] = _rules_df.filter(col("entity") == entity).collect()

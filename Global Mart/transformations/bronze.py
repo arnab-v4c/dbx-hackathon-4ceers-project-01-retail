@@ -1,4 +1,3 @@
-# Databricks notebook source
 # =============================================================================
 # GlobalMart — Bronze Layer Ingestion Pipeline
 # Target Schema: globalmart.bronze
@@ -35,7 +34,7 @@ SCHEMA_BASE = spark.conf.get(
     "/Volumes/globalmart/bronze/pipeline_metadata/schemas"
 )
 
-spark.sql("USE CATALOG globalmart_new")
+spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA bronze")
 
 # =============================================================================

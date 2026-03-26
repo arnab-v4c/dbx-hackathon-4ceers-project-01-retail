@@ -1,4 +1,3 @@
-# Databricks notebook source
 # =============================================================================
 # GlobalMart — Pipeline Utilities
 # Path: /Workspace/dbx_retail/Globalmart/utilities/utils.py
