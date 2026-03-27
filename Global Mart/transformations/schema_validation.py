@@ -32,10 +32,10 @@ CONTRACTS = {
 # COMMAND ----------
 
 @dp.table(
-    name="schema_validation_current",
+    name="schema_validation_bronze",
     comment="Pre-Bronze schema contract validation. One row per source file per run."
 )
-def schema_validation_current():
+def schema_validation_bronze():
     results = []
 
     # 1. Discover all raw files recursively from the Volume
