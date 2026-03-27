@@ -3,9 +3,9 @@
 # GlobalMart — Schema Contract Validation (SDP)
 # Target Schema: globalmart.raw
 #
-# Reads Bronze streaming tables via dp.read(), validates schemas against
-# minimum contracts, outputs a streaming table with results.
-# Runs as part of the Silver pipeline (not Bronze — avoids circular refs).
+# Reads raw files directly from the Unity Catalog Volume, validates individual
+# file schemas against minimum contracts, and outputs a streaming table.
+# Runs as a Pre-Bronze check to catch file-level anomalies before Auto Loader.
 # =============================================================================
 
 # COMMAND ----------
@@ -17,7 +17,6 @@ import uuid
 
 spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA raw")
-
 
 _RUN_ID = str(uuid.uuid4())
 
@@ -34,17 +33,43 @@ CONTRACTS = {
 
 @dp.table(
     name="schema_validation_current",
-    comment="Post-Bronze schema contract validation. One row per entity per run."
+    comment="Pre-Bronze schema contract validation. One row per source file per run."
 )
 def schema_validation_current():
     results = []
 
-    for entity, c in CONTRACTS.items():
-        bronze = spark.read.table(f"globalmart.bronze.{entity}")
-        cols_lower = [col_name.lower() for col_name in bronze.columns]
-        skip = {"source_file", "load_timestamp", "_source_file", "_load_timestamp", "rescued_data"}
-        data_cols = [x for x in cols_lower if x not in skip]
+    # 1. Discover all raw files recursively from the Volume
+    # This is a DLT-safe way to list files without using dbutils
+    files_df = spark.read.format("binaryFile").option("recursiveFileLookup", "true").load("/Volumes/globalmart/raw/source_files/")
+    file_paths = [row.path for row in files_df.select("path").collect()]
 
+    for path in file_paths:
+        file_name = path.split("/")[-1]
+        
+        # 2. Determine which entity this file belongs to based on name/path
+        entity = None
+        for e in CONTRACTS.keys():
+            if e in file_name.lower() or e in path.lower():
+                entity = e
+                break
+                
+        if not entity:
+            continue
+            
+        c = CONTRACTS[entity]
+        
+        # 3. Read the exact schema of this specific file directly from the raw volume
+        file_format = "json" if path.endswith(".json") else "csv"
+        try:
+            if file_format == "csv":
+                file_df = spark.read.format("csv").option("header", "true").load(path)
+            else:
+                file_df = spark.read.format("json").load(path)
+            
+            data_cols = [col_name.lower() for col_name in file_df.columns]
+        except Exception as e:
+            data_cols = []
+            
         key_variants = c["key_variants"].split(",")
         required = [r for r in c["required"].split(",") if r]
 
@@ -64,7 +89,9 @@ def schema_validation_current():
             issues.append(f"Missing: {missing}")
 
         results.append(Row(
+            file_name=file_name,
             entity=entity,
+            file_path=path,
             status=overall,
             data_columns=len(data_cols),
             columns_found=", ".join(sorted(data_cols)),
@@ -74,6 +101,24 @@ def schema_validation_current():
             issues="; ".join(issues) if issues else "None",
             _run_id=_RUN_ID
         ))
+
+    # Handle the edge case where no files exist yet to avoid PySpark schema inference errors
+    if not results:
+        from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+        schema = StructType([
+            StructField("file_name", StringType(), True),
+            StructField("entity", StringType(), True),
+            StructField("file_path", StringType(), True),
+            StructField("status", StringType(), True),
+            StructField("data_columns", IntegerType(), True),
+            StructField("columns_found", StringType(), True),
+            StructField("key_check", StringType(), True),
+            StructField("required_check", StringType(), True),
+            StructField("min_columns_check", StringType(), True),
+            StructField("issues", StringType(), True),
+            StructField("_run_id", StringType(), True)
+        ])
+        return spark.createDataFrame([], schema).withColumn("validated_at", current_timestamp())
 
     return (
         spark.createDataFrame(results)
