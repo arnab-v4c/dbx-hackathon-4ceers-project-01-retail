@@ -33,7 +33,7 @@ CONTRACTS = {
 # COMMAND ----------
 
 @dp.table(
-    name="globalmart.gold.schema_validation_current",
+    name="schema_validation_current",
     comment="Post-Bronze schema contract validation. One row per entity per run."
 )
 def schema_validation_current():
