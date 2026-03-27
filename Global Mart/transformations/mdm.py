@@ -1,7 +1,7 @@
 # Databricks notebook source
 # =============================================================================
 # GlobalMart — MDM (Master Data Management) Layer Pipeline
-# Target: globalmart_new.mdm
+# Target: globalmart.mdm
 # =============================================================================
 
 from pyspark import pipelines as dp
@@ -13,7 +13,7 @@ spark.sql("USE SCHEMA mdm")
 
 @dp.table(name="customers", comment="Master customer record")
 def mdm_customers():
-    silver = spark.read.table("globalmart_new.silver.customers")
+    silver = spark.read.table("globalmart.silver.customers")
 
     ranked = silver.withColumn(
         "_source_rank",
@@ -58,7 +58,7 @@ def mdm_customers():
 
 @dp.table(name="products")
 def mdm_products():
-    silver = spark.read.table("globalmart_new.silver.products")
+    silver = spark.read.table("globalmart.silver.products")
     w = Window.partitionBy("product_id").orderBy(col("_load_timestamp").desc())
     return silver.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).select(
         "product_id", "product_name", "brand", "categories", "colors", "manufacturer", "dimension", "sizes",
@@ -67,6 +67,6 @@ def mdm_products():
 
 @dp.table(name="vendors")
 def mdm_vendors():
-    silver = spark.read.table("globalmart_new.silver.vendors")
+    silver = spark.read.table("globalmart.silver.vendors")
     w = Window.partitionBy("vendor_id").orderBy(col("_load_timestamp").desc())
     return silver.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).select("vendor_id", "vendor_name", "_load_timestamp")

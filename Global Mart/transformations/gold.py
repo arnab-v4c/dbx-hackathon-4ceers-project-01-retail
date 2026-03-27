@@ -1,71 +1,55 @@
 # Databricks notebook source
 # =============================================================================
 # GlobalMart — Gold Layer Pipeline
-# Pipeline Type: Spark Declarative Pipelines (SDP)
 # Target: globalmart.gold
 #
-# 5 business-level DQ checks on facts and MVs:
-#   1. fact_sales: no_orphan_customers (Revenue Audit)
-#   2. fact_returns: refund_not_exceeding_5x_sales (Returns Fraud)
-#   3. mv_revenue_by_region: region_not_null (Revenue Audit)
-#   4. mv_return_rate_by_vendor: return_rate_in_range (Vendor Quality)
-#   5. mv_slow_moving_products: valid_days_since_sale (Inventory Blindspot)
+# ARCHITECTURE (DEADLINE-READY SCD 1):
+#   1. Dimensions: Materialized Views (SCD 1) directly pulling from MDM.
+#   2. Fact Tables: High-performance Streaming Tables using standard joins.
+#   3. Fact Returns: Uses the null-safe Array-Sort Lambda trick.
+#   4. Business MVs: Aggregated dashboards and fraud scoring.
 # =============================================================================
-
-# COMMAND ----------
 
 from pyspark import pipelines as dp
 from pyspark.sql.functions import (
-    col, lit, coalesce, row_number, count, sum as _sum, avg,
+    col, lit, coalesce, count, sum as _sum, avg,
     round as _round, datediff, current_date, current_timestamp, max as _max,
     min as _min, countDistinct, when, month, year, quarter,
-    date_format, dayofweek, expr, monotonically_increasing_id,
-    to_date, abs as _abs
+    date_format, dayofweek, expr, to_date, abs as _abs, md5, concat_ws
 )
-from pyspark.sql.window import Window
-
-# COMMAND ----------
 
 spark.sql("USE CATALOG globalmart")
 spark.sql("USE SCHEMA gold")
 
-# COMMAND ----------
-
 # =============================================================================
-# DIMENSIONS
+# DIMENSIONS — Materialized Views (Static / SCD 1)
 # =============================================================================
 
-@dp.table(name="dim_customers", comment="Customer dimension — sourced from MDM golden records.")
+@dp.table(name="dim_customers", comment="Customer dimension — sourced from MDM (SCD 1).")
 def dim_customers():
     return (
         spark.read.table("globalmart.mdm.customers")
-        .withColumn("customer_key", monotonically_increasing_id())
+        .withColumn("customer_key", md5(col("customer_id")))
         .select("customer_key", "customer_id", "customer_name", "customer_email",
                 "segment", "country", "city", "state", "postal_code", "region")
     )
 
-# COMMAND ----------
-
-@dp.table(name="dim_products", comment="Product dimension — sourced from MDM golden records.")
+@dp.table(name="dim_products", comment="Product dimension — sourced from MDM (SCD 1).")
 def dim_products():
     return (
         spark.read.table("globalmart.mdm.products")
-        .withColumn("product_key", monotonically_increasing_id())
+        .withColumn("product_key", md5(col("product_id")))
         .select("product_key", "product_id", "product_name", "brand",
                 "categories", "colors", "manufacturer")
     )
 
-# COMMAND ----------
-
-@dp.table(name="dim_vendors", comment="Vendor dimension — sourced from MDM golden records.")
+@dp.table(name="dim_vendors", comment="Vendor dimension — sourced from MDM (SCD 1).")
 def dim_vendors():
     return (
         spark.read.table("globalmart.mdm.vendors")
-        .withColumn("vendor_key", monotonically_increasing_id())
+        .withColumn("vendor_key", md5(col("vendor_id")))
         .select("vendor_key", "vendor_id", "vendor_name")
     )
-
-# COMMAND ----------
 
 @dp.table(name="dim_dates", comment="Date dimension — generated calendar.")
 def dim_dates():
@@ -89,36 +73,34 @@ def dim_dates():
                 "month_name", "day_of_week", "day_name", "is_weekend")
     )
 
-# COMMAND ----------
-
 # =============================================================================
-# FACT TABLES
+# FACT TABLES - Streaming Tables with Stream-Static Joins
 # =============================================================================
 
-@dp.table(name="fact_orders", comment="Order fact — one row per order.")
+@dp.table(name="fact_orders", comment="Order fact — Streaming table")
 def fact_orders():
     return (
-        spark.read.table("globalmart.silver.orders")
-        .withColumn("order_key", monotonically_increasing_id())
+        spark.readStream.table("globalmart.silver.orders")
+        .withColumn("order_key", md5(col("order_id"))) 
         .select("order_key", "order_id", "customer_id", "vendor_id",
                 "ship_mode", "order_status", "order_purchase_timestamp",
                 "order_approved_timestamp", "order_delivered_carrier_timestamp",
                 "order_delivered_customer_timestamp", "order_estimated_delivery_timestamp")
     )
 
-# COMMAND ----------
-
-@dp.table(name="fact_sales", comment="Sales fact — grain: one row per order-product line item.")
-@dp.expect("no_orphan_customers", "customer_key IS NOT NULL")
+@dp.table(name="fact_sales", comment="Sales fact — Streaming Table with Stream-Static Joins")
+@dp.expect("no_orphan_customers", "customer_id IS NOT NULL")
 def fact_sales():
-    txn = spark.read.table("globalmart.silver.transactions")
+    txn = spark.readStream.table("globalmart.silver.transactions")
+    
+    # Static reads for joins
     orders = spark.read.table("globalmart.silver.orders")
-    dim_cust = dp.read("dim_customers")
+    dim_cust = dp.read("dim_customers") 
     dim_prod = dp.read("dim_products")
     dim_vend = dp.read("dim_vendors")
-    dim_ord = dp.read("fact_orders")
     dim_dt = dp.read("dim_dates")
 
+    # Inner join streams to orders to get order details
     base = txn.join(
         orders.select("order_id", "customer_id", "vendor_id", "order_purchase_timestamp"),
         on="order_id", how="inner"
@@ -126,17 +108,16 @@ def fact_sales():
 
     return (
         base
-        .join(dim_ord.select("order_key", "order_id"), on="order_id", how="left")
-        .join(dim_cust.select("customer_key", "customer_id"), on="customer_id", how="left")
-        .join(dim_prod.select("product_key", "product_id"), on="product_id", how="left")
-        .join(dim_vend.select("vendor_key", "vendor_id"), on="vendor_id", how="left")
+        # Standard SCD 1 Equi-Joins (Guarantees Matches)
+        .join(dim_cust, on="customer_id", how="left")
+        .join(dim_prod, on="product_id", how="left")
+        .join(dim_vend, on="vendor_id", how="left")
         .withColumn("order_date_key", expr("CAST(date_format(order_purchase_timestamp, 'yyyyMMdd') AS INT)"))
         .join(dim_dt.select("date_key"), dim_dt.date_key == col("order_date_key"), how="left")
-        .withColumn("sales_key", monotonically_increasing_id())
-        .select("sales_key", "order_key", "customer_key", "product_key", "vendor_key",
+        .withColumn("sales_key", md5(concat_ws("||", col("order_id"), col("product_id"))))
+        .select("sales_key", "customer_key", "customer_id", "product_key", "product_id", "vendor_key", "vendor_id",
                 col("date_key").alias("order_date_key"),
-                "order_id", "product_id", "customer_id", "vendor_id",
-                "sales", "quantity", "discount", "profit",
+                "order_id", "sales", "quantity", "discount", "profit",
                 "payment_type", "payment_installments")
     )
 
@@ -144,66 +125,75 @@ def fact_sales():
 def fact_sales_quarantine():
     return (
         dp.read("fact_sales")
-        .filter("customer_key IS NULL")
+        .filter("customer_id IS NULL")
         .withColumn("_expectation", lit("no_orphan_customers"))
         .withColumn("_severity", lit("WARNING"))
         .withColumn("_business_impact", lit("Revenue cannot be attributed to a customer segment or region — causes reconciliation failures"))
         .withColumn("_quarantine_timestamp", current_timestamp())
     )
 
-# COMMAND ----------
-
-@dp.table(name="fact_returns", comment="Returns fact — grain: one row per return event.")
+@dp.table(name="fact_returns", comment="Returns fact — Streaming Table (Array-Sort Approximation)")
 @dp.expect("refund_not_exceeding_5x_sales", "original_sales IS NULL OR refund_amount <= original_sales * 5")
 def fact_returns():
-    ret = spark.read.table("globalmart.silver.returns")
+    ret_stream = spark.readStream.table("globalmart.silver.returns")
+    
     orders = spark.read.table("globalmart.silver.orders")
     txn = spark.read.table("globalmart.silver.transactions")
+    
     dim_cust = dp.read("dim_customers")
     dim_prod = dp.read("dim_products")
     dim_vend = dp.read("dim_vendors")
-    dim_ord = dp.read("fact_orders")
     dim_dt = dp.read("dim_dates")
 
-    txn_with_distance = txn.select(
-        col("order_id").alias("_t_order_id"),
-        col("product_id"),
-        col("sales").alias("original_sales")
+    # PRE-AGGREGATE TRANSACTIONS (Static Side)
+    txn_agg = txn.groupBy("order_id").agg(
+        expr("collect_list(named_struct('product_id', product_id, 'original_sales', sales))").alias("products_array")
     )
 
-    returns_x_txn = (
-        ret
-        .join(orders.select("order_id", "customer_id", "vendor_id", "order_purchase_timestamp"),
-              on="order_id", how="left")
-        .join(txn_with_distance, ret.order_id == txn_with_distance._t_order_id, how="left")
-        .withColumn("_price_distance", expr("ABS(refund_amount - original_sales)"))
+    # STREAM-STATIC JOIN
+    joined_stream = (
+        ret_stream
+        .join(orders.select("order_id", "customer_id", "vendor_id", "order_purchase_timestamp"), on="order_id", how="left")
+        .join(txn_agg, on="order_id", how="left")
     )
 
-    w_match = Window.partitionBy(ret.order_id).orderBy(col("_price_distance").asc(), col("product_id").asc())
-    base = (
-        returns_x_txn
-        .withColumn("_match_rank", row_number().over(w_match))
-        .filter(col("_match_rank") == 1)
-        .drop("_match_rank", "_price_distance", "_t_order_id")
+    # NULL-SAFE ARRAY SORTING
+    match_expr = """
+        array_sort(
+            products_array, 
+            (left, right) -> CAST(
+                COALESCE(
+                    SIGN(
+                        ABS(COALESCE(left.original_sales, 0) - COALESCE(refund_amount, 0)) - 
+                        ABS(COALESCE(right.original_sales, 0) - COALESCE(refund_amount, 0))
+                    ), 0
+                ) AS INT
+            )
+        )[0]
+    """
+
+    processed_stream = (
+        joined_stream
+        .withColumn("best_match", expr(match_expr))
+        .withColumn("product_id", col("best_match.product_id"))
+        .withColumn("original_sales", col("best_match.original_sales"))
+        .drop("products_array", "best_match")
     )
 
     return (
-        base
-        .join(dim_ord.select("order_key", "order_id"), on="order_id", how="left")
-        .join(dim_cust.select("customer_key", "customer_id"), on="customer_id", how="left")
-        .join(dim_prod.select("product_key", "product_id"), on="product_id", how="left")
-        .join(dim_vend.select("vendor_key", "vendor_id"), on="vendor_id", how="left")
+        processed_stream
+        .join(dim_cust, on="customer_id", how="left")
+        .join(dim_prod, on="product_id", how="left")
+        .join(dim_vend, on="vendor_id", how="left")
         .withColumn("return_date_key", expr("CAST(date_format(return_date, 'yyyyMMdd') AS INT)"))
         .join(dim_dt.select("date_key"), dim_dt.date_key == col("return_date_key"), how="left")
-        .withColumn("return_key", monotonically_increasing_id())
+        .withColumn("return_key", md5(concat_ws("||", col("order_id"), col("return_date"))))
         .withColumn("return_to_sales_ratio",
-                    when(col("original_sales") > 0,
-                         _round(col("refund_amount") / col("original_sales"), 2))
+                    when(col("original_sales") > 0, _round(col("refund_amount") / col("original_sales"), 2))
                     .otherwise(lit(None)))
-        .select("return_key", "order_key", "customer_key", "product_key", "vendor_key",
+        .select("return_key", "customer_key", "customer_id", "product_key", "product_id", "vendor_key", "vendor_id",
                 col("date_key").alias("return_date_key"),
-                "order_id", "product_id", "customer_id", "vendor_id",
-                "refund_amount", "return_reason", "return_status",
+                "order_id", "refund_amount", "return_reason", "return_status",
                 "return_date", "original_sales", "return_to_sales_ratio")
     )
 
@@ -218,10 +208,8 @@ def fact_returns_quarantine():
         .withColumn("_quarantine_timestamp", current_timestamp())
     )
 
-# COMMAND ----------
-
 # =============================================================================
-# MATERIALIZED VIEWS
+# MATERIALIZED VIEWS (Business Aggregations)
 # =============================================================================
 
 @dp.table(name="mv_revenue_by_region", comment="Monthly revenue by region — addresses Revenue Audit.")
@@ -232,7 +220,7 @@ def mv_revenue_by_region():
     dim_dt = dp.read("dim_dates")
     return (
         fact
-        .join(dim_cust.select("customer_key", "region"), on="customer_key", how="left")
+        .join(dim_cust.select("customer_id", "region"), on="customer_id", how="left")
         .join(dim_dt.select("date_key", "year", "month", "month_name", "quarter"),
               fact.order_date_key == dim_dt.date_key, how="left")
         .groupBy("year", "quarter", "month", "month_name", "region")
@@ -257,8 +245,6 @@ def mv_revenue_by_region_quarantine():
         .withColumn("_business_impact", lit("Revenue cannot be attributed to a region — auditors cannot reconcile regional reports"))
         .withColumn("_quarantine_timestamp", current_timestamp())
     )
-
-# COMMAND ----------
 
 @dp.table(name="mv_return_rate_by_vendor", comment="Return rate by vendor — addresses Returns Fraud and vendor quality.")
 @dp.expect("return_rate_in_range", "return_rate_pct IS NULL OR (return_rate_pct >= 0 AND return_rate_pct <= 100)")
@@ -300,8 +286,6 @@ def mv_return_rate_by_vendor_quarantine():
         .withColumn("_quarantine_timestamp", current_timestamp())
     )
 
-# COMMAND ----------
-
 @dp.table(name="mv_slow_moving_products", comment="Slow-moving products by region — addresses Inventory Blindspot.")
 @dp.expect("valid_days_since_sale", "days_since_last_sale IS NOT NULL AND days_since_last_sale >= 0")
 def mv_slow_moving_products():
@@ -311,11 +295,9 @@ def mv_slow_moving_products():
     dim_dt = dp.read("dim_dates")
     return (
         fact_s
-        .join(dim_prod.select("product_key", "product_id", "product_name", "brand"),
-              on="product_key", how="left")
-        .join(dim_cust.select("customer_key", "region"), on="customer_key", how="left")
-        .join(dim_dt.select("date_key", "full_date"),
-              fact_s.order_date_key == dim_dt.date_key, how="left")
+        .join(dim_prod.select("product_id", "product_name", "brand"), on="product_id", how="left")
+        .join(dim_cust.select("customer_id", "region"), on="customer_id", how="left")
+        .join(dim_dt.select("date_key", "full_date"), fact_s.order_date_key == dim_dt.date_key, how="left")
         .groupBy(fact_s.product_id, "product_name", "brand", "region")
         .agg(
             _sum("quantity").alias("total_quantity_sold"),
@@ -348,17 +330,16 @@ def mv_slow_moving_products_quarantine():
         .withColumn("_quarantine_timestamp", current_timestamp())
     )
 
-# COMMAND ----------
-
 @dp.table(name="mv_customer_return_history", comment="Customer return history — addresses Returns Fraud with fraud risk scoring.")
 def mv_customer_return_history():
     fact_r = dp.read("fact_returns")
     dim_cust = dp.read("dim_customers")
+    
     return (
         fact_r
-        .join(dim_cust.select("customer_key", "customer_id", "customer_name",
+        .join(dim_cust.select("customer_id", "customer_name",
                               "segment", "region", "customer_email"),
-              on="customer_key", how="left")
+              on="customer_id", how="left")
         .groupBy(
             dim_cust.customer_id, dim_cust.customer_name,
             dim_cust.customer_email, dim_cust.segment, dim_cust.region

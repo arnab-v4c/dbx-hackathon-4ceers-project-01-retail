@@ -201,13 +201,16 @@ RESPOND WITH ONLY a JSON array. No explanation, no markdown, no backticks. Examp
   {{"source_column": "order_date", "canonical_column": "order_purchase_timestamp", "transformation": "COALESCE(TRY_TO_TIMESTAMP({{col}}, 'MM/dd/yyyy HH:mm'), TRY_TO_TIMESTAMP({{col}}, 'yyyy-MM-dd HH:mm'))"}}
 ]"""
 
-    response = client.predict(
-        endpoint="databricks-claude-sonnet-4-20250514",
-        inputs={
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 4000,
-            "temperature": 0.0
-        }
+    context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+    client = OpenAI(
+    api_key=context.apiToken().get(),
+    base_url=f"{context.apiUrl().get()}/serving-endpoints"
+    )
+
+    response = client.chat.completions.create(
+    model="databricks-gpt-oss-20b",
+    messages=[{"role": "user", "content": prompt}],
+    temperature=0.1, 
     )
 
     raw_text = response.choices[0]["message"]["content"].strip()
